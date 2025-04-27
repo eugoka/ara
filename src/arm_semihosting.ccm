@@ -1,0 +1,63 @@
+module;
+#include <concepts>
+#include <cstddef>
+#include <stdexcept>
+#include <utility>
+export module arm_semihosting;
+namespace arm_semihosting {
+export enum class Operations {
+    kSysClock = 0x10,
+    kSysClose = 0x02,
+    kSysElapsed = 0x30,
+    kSysErrno = 0x13,
+    kSysExit = 0x18,
+    kSysExitExtended = 0x20,
+    kSysFlen = 0x0c,
+    kSysGetCmdline = 0x15,
+    kSysHeapinfo = 0x16,
+    kSysIserror = 0x08,
+    kSysIstty = 0x09,
+    kSysOpen = 0x01,
+    kSysRead = 0x06,
+    kSysReadc = 0x07,
+    kSysRemove = 0x0e,
+    kSysRename = 0x0f,
+    kSysSeek = 0x0a,
+    kSysSystem = 0x12,
+    kSysTickfreq = 0x31,
+    kSysTime = 0x11,
+    kSysTmpnam = 0x0d,
+    kSysWrite = 0x05,
+    kSysWritec = 0x03,
+    kSysWrite0 = 0x04,
+};
+template <typename T>
+concept Target = requires(T t, typename std::remove_reference_t<T>::Pointer p) {
+    { t.GetSemihostingOperation() } -> std::convertible_to<Operations>;
+    { t.GetSemihostingParameter() } -> std::convertible_to<decltype(p)>;
+    { t.ReadMemory(p) } -> std::convertible_to<std::byte>;
+};
+export template <typename DebugIO>
+class SemihostingHandler {
+    DebugIO debug_iostream_;
+
+   public:
+    template <Target T>
+    void handle(T &&t) {
+        switch (t.GetSemihostingOperation()) {
+            case Operations::kSysWritec:
+                debug_iostream_.put(static_cast<char>(
+                    t.ReadMemory(t.GetSemihostingParameter())));
+                break;
+            default:
+                throw std::runtime_error("Unimplemented");
+        }
+    }
+    template <typename DebugStream>
+    SemihostingHandler(DebugStream &&debug_iostream)
+        : debug_iostream_(std::forward<DebugStream>(debug_iostream)){};
+};
+template <typename DebugStream>
+SemihostingHandler(DebugStream &&debug_iostream)
+    -> SemihostingHandler<DebugStream>;
+}  // namespace arm_semihosting
