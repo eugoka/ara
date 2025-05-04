@@ -1,0 +1,28 @@
+interface/ftdi/um232h.cfg
+
+  idVendor           0x0403 Future Technology Devices International, Ltd
+  idProduct          0x6014 FT232H Single HS USB-UART/FIFO IC
+
+AD0   TCK
+AD1   TDI
+AD2   TDO
+AD3   TMS
+AD4-7 GPIOL0-3
+
+AC0   GPIOH0(TRST)
+AC1   GPIOH1(SRST)
+AC2-7 GPIOH2-7
+
+StarFive VisionFive2
+
+35 TMS
+37 TCK
+39 GND
+
+36 TRSTN
+38 TDI
+40 TDO
+
+6  GND
+8  UART TX
+10 UART RX
