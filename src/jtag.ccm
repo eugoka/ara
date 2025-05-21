@@ -1,0 +1,102 @@
+module;
+#include <magic_enum/magic_enum.hpp>
+#include <magic_enum/magic_enum_utility.hpp>
+#include <algorithm>
+#include <functional>
+#include <iostream>
+export module jtag;
+namespace jtag {
+    export enum class State {
+        kTLR,
+        kRTI,
+        kSelectDR,
+        kCaptureDR,
+        kShiftDR,
+        kExit1DR,
+        kPauseDR,
+        kExit2DR,
+        kUpdateDR,
+        kSelectIR,
+        kCaptureIR,
+        kShiftIR,
+        kExit1IR,
+        kPauseIR,
+        kExit2IR,
+        kUpdateIR,
+    };
+
+    constexpr enum State next(enum State current, bool tms) {
+        switch(current) {
+        case State::kTLR:
+            return tms ? State::kTLR : State::kRTI;
+        case State::kRTI:
+            return tms ? State::kSelectDR : State::kRTI;
+        case State::kSelectDR:
+            return tms ? State::kSelectIR : State::kCaptureDR;
+        case State::kCaptureDR:
+        case State::kShiftDR:
+            return tms ? State::kExit1DR : State::kShiftDR;
+        case State::kExit1DR:
+            return tms ? State::kUpdateDR : State::kPauseDR;
+        case State::kPauseDR:
+            return tms ? State::kExit2DR : State::kPauseDR;
+        case State::kExit2DR:
+            return tms ? State::kUpdateDR : State::kShiftDR;
+        case State::kUpdateDR:
+            return tms ? State::kSelectDR : State::kRTI;
+        case State::kSelectIR:
+            return tms ? State::kTLR : State::kCaptureIR;
+        case State::kCaptureIR:
+        case State::kShiftIR:
+            return tms ? State::kExit1IR : State::kShiftIR;
+        case State::kExit1IR:
+            return tms ? State::kUpdateIR : State::kPauseIR;
+        case State::kPauseIR:
+            return tms ? State::kExit2IR : State::kPauseIR;
+        case State::kExit2IR:
+            return tms ? State::kUpdateIR : State::kShiftIR;
+        case State::kUpdateIR:
+            return tms ? State::kSelectDR : State::kRTI;
+        }
+    }
+    export class Path {
+        public:
+        unsigned length_;
+        unsigned tms_bits_;
+        constexpr Path(State start, State finish) {
+            constexpr auto kNStates = magic_enum::enum_count<State>();
+            std::array<std::pair<State, unsigned>, kNStates> queue;
+            std::array<unsigned, kNStates> dist;
+            std::array<State, kNStates> prev;
+            std::fill(dist.begin(), dist.end(), kNStates);
+            dist[magic_enum::enum_index(start).value()] = 0;
+            auto queue_cmp = [](auto lhs, auto rhs){ return lhs.second > rhs.second;};
+            auto heap_start = std::begin(queue);
+            auto heap_end = heap_start + 1;
+            *heap_start = {start, 0};
+            while (heap_start != heap_end) {
+                auto cur_v = *heap_start;
+                std::pop_heap(heap_start, heap_end, queue_cmp);
+                --heap_end;
+                for (auto tms : {false, true}) {
+                    auto next_state = next(cur_v.first, tms);
+                    auto alt = dist[magic_enum::enum_index(cur_v.first).value()] + 1;
+                    auto idx = magic_enum::enum_index(next_state).value();
+                    if (alt < dist[idx]) {
+                        dist[idx] = alt;
+                        prev[idx] = cur_v.first;
+                        *heap_end = {next_state, alt};
+                        std::push_heap(heap_start, ++heap_end, queue_cmp);
+                    }
+                }
+            }
+            length_ = dist[magic_enum::enum_index(finish).value()];
+            tms_bits_ = 0;
+            for (State state = finish, prev_state; state != start; state = prev_state) {
+                prev_state = prev[magic_enum::enum_index(state).value()];
+                tms_bits_ <<= 1;
+                tms_bits_ |= (state == next(prev_state, true)) ? 1 : 0;
+            }
+        }
+    };
+}

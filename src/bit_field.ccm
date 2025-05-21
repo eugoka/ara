@@ -1,0 +1,100 @@
+module;
+#include <algorithm>
+#include <climits>
+#include <vector>
+#include <span>
+#include <variant>
+#include <ranges>
+#include <cassert>
+export module bit_field;
+namespace bit_field {
+// helper type for the visitor
+template<class... Ts>
+struct overloads : Ts... { using Ts::operator()...; };
+
+std::byte getBits(std::byte byte, unsigned char low, unsigned char high) {
+    assert(low <= high);
+    assert(high <= 8);
+    return (byte & (~std::byte{} >> (CHAR_BIT - high))) >> low;
+}
+export class Field {
+    struct SingleField {
+        unsigned char offset_;
+        unsigned char length_;
+        std::span<std::byte> data_;
+    };
+    using MultiField = std::vector<Field>;
+    std::variant<
+        SingleField,
+        MultiField
+    > data_;
+public:
+    Field(unsigned char length, unsigned char offset = 0) : data_(SingleField{.offset_ = offset, .length_ = length}) {}
+    unsigned char size() const {
+        auto visitor = overloads {
+            [](SingleField field){
+                return 1 + (field.offset_ + field.length_ - 1) / CHAR_BIT;
+            },
+            [](MultiField fields){
+                return std::ranges::fold_left(fields, (unsigned char){}, [](auto res, const auto &field){
+                        return res + field.size();
+                });
+            },
+        };
+        return std::visit(visitor, data_);
+    }
+    unsigned char bitLen() const {
+        auto visitor = overloads {
+            [](SingleField field) {
+                return field.length_;
+            },
+            [](MultiField fields) -> unsigned char {
+                return std::ranges::fold_left(fields, (unsigned char){}, [](auto res, const auto &field){
+                        return res + field.bitLen();
+                });
+            }
+        };
+        return std::visit(visitor, data_);
+    }
+    void set_storage(std::span<std::byte> span) {
+        auto visitor = overloads {
+            [span](SingleField &field){
+                field.data_ = span;
+            },
+            [span](MultiField &fields) mutable {
+                for (auto field : fields) {
+                    auto size = field.size();
+                    field.set_storage(span | std::ranges::views::take(size));
+                    span = span | std::ranges::views::drop(size);
+                }
+            },
+        };
+        return std::visit(visitor, data_);
+    }
+    template <typename V>
+    V get() const {
+        auto visitor = overloads {
+            [](SingleField field) -> V {
+                unsigned char n_bytes = field.data_.size();
+                if (n_bytes == 1)
+                    return static_cast<V>(getBits(field.data_.front(), field.offset_, field.offset_ + field.length_));
+
+                V res{};
+                for (unsigned char i = 1; i < n_bytes - 1; ++i)
+                    res |= static_cast<V>(field.data_[i]) << (i * CHAR_BIT - field.offset_);
+                res |= static_cast<V>(getBits(field.data_.front(), field.offset_, CHAR_BIT));
+                unsigned char high_byte_start = CHAR_BIT * (n_bytes - 1);
+                res |= static_cast<V>(getBits(field.data_.back(), 0, field.length_ + field.offset_ - high_byte_start)) << (high_byte_start - field.offset_);
+                return res;
+            },
+            [](MultiField fields) -> V {
+                return std::ranges::fold_left(fields, std::pair{(unsigned char){}, V{}}, [](auto res, const auto &field){
+                        auto [cur_offset, value] = res;
+                        return std::pair{cur_offset + field.bitLen(), value | (field.template get<V>() << cur_offset)};
+                }).second;
+            },
+        };
+        return std::visit(visitor, data_);
+    }
+};
+}

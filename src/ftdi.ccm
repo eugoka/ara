@@ -1,0 +1,151 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+
+#include "jtag.h"
+#include "libftdi1/ftdi.h"
+
+auto mpsse_byte_io_cmd(auto n_bytes) {
+    assert(n_bytes);
+    return std::array{
+        static_cast<unsigned char>(MPSSE_LSB | MPSSE_WRITE_NEG |
+                                   MPSSE_DO_WRITE | MPSSE_DO_READ),
+        static_cast<unsigned char>((n_bytes - 1) & 0xff),
+        static_cast<unsigned char>((((n_bytes - 1) & (0xff << 8)) >> 8))};
+}
+
+auto mpsse_bit_io_cmd(auto n_bits, auto bits) {
+    assert(n_bits);
+    return std::array{static_cast<unsigned char>(MPSSE_LSB | MPSSE_WRITE_NEG |
+                                                 MPSSE_DO_WRITE |
+                                                 MPSSE_DO_READ | MPSSE_BITMODE),
+                      static_cast<unsigned char>(n_bits - 1),
+                      static_cast<unsigned char>(bits)};
+}
+
+auto mpsse_tms_i_cmd(auto n_tms, auto tms_bits, auto tdi) {
+    assert(n_tms);
+    return std::array{static_cast<unsigned char>(MPSSE_LSB | MPSSE_WRITE_NEG |
+                                                 MPSSE_WRITE_TMS |
+                                                 MPSSE_DO_READ | MPSSE_BITMODE),
+                      static_cast<unsigned char>(n_tms),
+                      static_cast<unsigned char>((tms_bits << 1) |
+                                                 1 /*exit loop*/ | (tdi << 7))};
+}
+
+struct jtag_driver {
+    static constexpr unsigned VID = 0x403;
+    static constexpr unsigned PID = 0x6014;
+    static constexpr unsigned MPSSE_CMD_MAX_BYTES = 1000;
+
+    std::unique_ptr<struct ftdi_context, decltype(&ftdi_free)> ftdi_;
+    jtag_driver() : ftdi_(nullptr, ftdi_free) {
+        decltype(ftdi_) ftdi{ftdi_new(), ftdi_free};
+        if (!ftdi) throw std::runtime_error("");
+        if (ftdi_usb_open(ftdi.get(), VID, PID) < 0)
+            throw std::runtime_error("");
+        if (ftdi_usb_reset(ftdi.get()) < 0) throw std::runtime_error("");
+        if (ftdi_set_latency_timer(ftdi.get(), 255) < 0)
+            throw std::runtime_error("");
+        if (ftdi_set_bitmode(ftdi.get(), 0, BITMODE_MPSSE) < 0)
+            throw std::runtime_error("");
+        if (ftdi_tcioflush(ftdi.get()) < 0) throw std::runtime_error("");
+        unsigned char cmd[] = {
+            SET_BITS_LOW, 0xf8, 0xfb,
+            SET_BITS_HIGH, 0xff, 0xff,
+            LOOPBACK_END,
+            DIS_ADAPTIVE, DIS_DIV_5, TCK_DIVISOR, 0x2f, 0x75};
+        ftdi_write_data(ftdi.get(), cmd, sizeof(cmd)); // TODO: ERROR
+        ftdi_ = std::move(ftdi);
+    }
+    void submit_loop_and_move(unsigned int loop_count, unsigned char *in,
+                              const unsigned char *out, unsigned int n_tms,
+                              unsigned char tms_bits) {
+        assert(loop_count);
+        auto div_bytes = std::div(loop_count - 1, 8);
+        auto n_bytes = div_bytes.quot, n_bits = div_bytes.rem + 1;
+        assert(n_bytes <= MPSSE_CMD_MAX_BYTES);
+        assert(n_tms < 7);
+        std::vector<unsigned char> mpsse_data;
+        if (n_bytes) {
+            std::ranges::move(mpsse_byte_io_cmd(n_bytes),
+                              std::back_inserter(mpsse_data));
+            if (out)
+                std::move(out, out + n_bytes, std::back_inserter(mpsse_data));
+            else
+                std::fill_n(std::back_inserter(mpsse_data), n_bytes, 0xff);
+        }
+        if (n_bits > 1)
+            std::ranges::move(
+                mpsse_bit_io_cmd(n_bits - 1, out ? out[n_bytes] : 1),
+                std::back_inserter(mpsse_data));
+        std::ranges::move(
+            mpsse_tms_i_cmd(n_tms, tms_bits, out ? (out[n_bytes] >> (n_bits - 1)) : 1),
+            std::back_inserter(mpsse_data));
+        auto tc = ftdi_write_data_submit(ftdi_.get(), mpsse_data.data(),
+                                         mpsse_data.size());
+        if (!tc) throw std::runtime_error("");
+        request_queue.emplace_back(tc, in, n_bytes, n_bits);
+    }
+    struct request {
+        struct ftdi_transfer_control *tc_;
+        unsigned char *in_;
+        unsigned n_bytes_;
+        unsigned n_bits_;
+        request(struct ftdi_transfer_control *tc, unsigned char *in,
+                unsigned n_bytes, unsigned n_bits)
+            : tc_(tc), in_(in), n_bytes_(n_bytes), n_bits_(n_bits) {}
+        template <typename It>
+        void set_data(It it) const {
+            if (!in_) return;
+            std::move(it, it + n_bytes_, in_);
+            unsigned bits_in_low = n_bits_ - 1;
+            unsigned char high_bits = 0; //it[mpsse_buf_size() - 1] << bits_in_low;
+            unsigned char low_bits = 0;
+            if (n_bits_ > 1) {
+                low_bits = it[n_bytes_] >> (8 - bits_in_low);
+            }
+            in_[n_bytes_] = low_bits | high_bits;
+        }
+        unsigned mpsse_buf_size() const {
+            return n_bytes_ + (n_bits_ > 1 ? 1 : 0) + 1;
+        }
+    };
+    std::vector<request> request_queue;
+    std::vector<unsigned char> read_buffer;
+    enum jtag_error complete() {
+        read_buffer.resize(std::ranges::fold_left(request_queue, 0u, [](unsigned sum, const auto &request){
+                    return sum + request.mpsse_buf_size();
+                    }));
+        for (unsigned int bytes_read = 0; bytes_read < read_buffer.size(); )
+            bytes_read += ftdi_read_data(ftdi_.get(), read_buffer.data() + bytes_read, read_buffer.size() - bytes_read);
+        auto read_buffer_it = read_buffer.begin();
+        for (auto &&request : request_queue) {
+            request.set_data(read_buffer_it);
+            read_buffer_it += request.mpsse_buf_size();
+        }
+        return JTAG_OK;
+    }
+};
+
+struct jtag_driver *jtag_init() { return new jtag_driver; }
+
+enum jtag_error jtag_deinit(struct jtag_driver *driver) {
+    delete driver;
+    return JTAG_OK;
+}
+
+void jtag_submit_loop_and_move(struct jtag_driver *driver,
+                               unsigned int loop_count, unsigned char *in,
+                               const unsigned char *out, unsigned int n_tms,
+                               int tms_bits) {
+    return driver->submit_loop_and_move(loop_count, in, out, n_tms, tms_bits);
+}
+
+enum jtag_error jtag_complete(struct jtag_driver *driver) {
+    return driver->complete();
+}
