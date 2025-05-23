@@ -60,7 +60,7 @@ void submit_dmi_scan(struct jtag_driver *driver,
         in_data,
         bit_field::Field{7} //TODO this is not a constant in general
     };
-    jtag_submit_loop_and_move(driver, NULL, &singleEmptyBit, 2, 1) /* to SHIFT-DR */;
+    jtag_submit_loop_and_move(driver, NULL, &singleEmptyBit, 2, 0) /* to SHIFT-DR */;
     jtag_submit_loop_and_move(driver, &in_data, &out, 2, 1); /* to RTI */;
 }
 
@@ -85,20 +85,38 @@ int main() {
     };
     submit_dtmcs_scan(driver, &dtmcs_in, &dtmcs_out);
 
+    jtag_complete(driver);
+
     submit_select_dmi(driver);
 
-    bit_field::Field dmstatus_in {
+    bit_field::Field dmcontrol_in_req {
         bit_field::Field{32}
     };
     unsigned dmi_status = 0;
     bit_field::Field dmi_status_in {
         bit_field::Field{2, std::as_writable_bytes(std::span(&dmi_status, 1))},
     };
-    submit_dmi_scan(driver, dmstatus_in, dmi_status_in,
-            0x11 /*dmstatus addr*/, DMI_READ, 0x0);
+    submit_select_dmi(driver);
+    submit_dmi_scan(driver, dmcontrol_in_req, dmi_status_in,
+            0x10 /*dmcontrol addr*/, DMI_READ, 0x0);
 
-    unsigned dmstatus = 0;
+    unsigned dmcontrol = 0;
+    bit_field::Field dmcontrol_in {
+        bit_field::Field{32, std::as_writable_bytes(std::span(&dmcontrol, 1))}
+    };
+    submit_dmi_scan(driver, dmcontrol_in, dmi_status_in,
+            0x0, DMI_NOP, 0x0);
         //, std::as_writable_bytes(std::span(&dmstatus, 1))},
+#if 0
+    dtmcsVersion = 0, dtmcsAbits = 0;
+    dtmcs_out = bit_field::Field{32};
+    dtmcs_in = bit_field::Field{
+        bit_field::Field{4, std::as_writable_bytes(std::span(&dtmcsVersion, 1))},
+        bit_field::Field{7, std::as_writable_bytes(std::span(&dtmcsAbits, 1))},
+        bit_field::Field{21}
+    };
+    submit_dtmcs_scan(driver, &dtmcs_in, &dtmcs_out);
+#endif
     jtag_complete(driver);
     jtag_deinit(driver);
     check(idcodes[0] == idcodes[1]);
@@ -106,6 +124,6 @@ int main() {
     check(dtmcsVersion == 1);
     check(dtmcsAbits == 7);
 
-    std::cout << "Status: " << dmi_status << " dmstatus: " << dmstatus << "\n";
+    std::cout << "Status: " << dmi_status << " dmcontrol: " << dmcontrol << "\n";
     return ExitCode;
 }
