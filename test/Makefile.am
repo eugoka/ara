@@ -1,1 +1,2 @@
-SUBDIRS = unit
+SUBDIRS = unit \
+		  e2e

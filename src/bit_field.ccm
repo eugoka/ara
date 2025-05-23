@@ -1,100 +1,199 @@
 module;
 #include <algorithm>
+#include <bit>
+#include <cassert>
 #include <climits>
-#include <vector>
+#include <initializer_list>
+#include <limits>
+#include <ranges>
 #include <span>
 #include <variant>
-#include <ranges>
-#include <cassert>
+#include <vector>
+
 export module bit_field;
 namespace bit_field {
-// helper type for the visitor
-template<class... Ts>
-struct overloads : Ts... { using Ts::operator()...; };
+template <class... Ts>
+struct overloads : Ts... {
+    using Ts::operator()...;
+};
+
+auto shiftBits(std::unsigned_integral auto val, unsigned char shift) {
+    assert(shift <= std::numeric_limits<decltype(val)>::digits);
+    return shift > 0 ? val << shift : val >> (-shift);
+}
 
 std::byte getBits(std::byte byte, unsigned char low, unsigned char high) {
     assert(low <= high);
     assert(high <= 8);
     return (byte & (~std::byte{} >> (CHAR_BIT - high))) >> low;
 }
+
+std::byte mask(unsigned char low, unsigned char high) {
+    return getBits(~std::byte{}, low, high) << low;
+}
+
+void setBits(std::byte &dst, std::byte src, unsigned char low,
+             unsigned char high) {
+    assert(low <= high);
+    assert(high <= CHAR_BIT);
+    assert((src >> high) == std::byte{0});
+    auto field_mask = mask(low, high);
+    dst = dst & ~field_mask | (src << low) & field_mask;
+}
+
+export void copyBits(std::ranges::range auto src, std::span<std::byte> dst,
+                     unsigned char nBits, unsigned char srcEmptyField = 0,
+                     unsigned char dstEmptyField = 0) {
+    assert(srcEmptyField < CHAR_BIT);
+    assert(dstEmptyField < CHAR_BIT);
+    auto srcIt = std::begin(src);
+    auto dstIt = std::begin(dst);
+    for (auto nBytes = 0; nBytes * CHAR_BIT < nBits;
+         ++nBytes, ++srcIt, ++dstIt) {
+        std::byte currentByte;
+        auto nBitsLeft = nBits - nBytes * CHAR_BIT;
+        if (srcEmptyField + nBitsLeft < CHAR_BIT)
+            currentByte =
+                getBits(*srcIt, srcEmptyField, srcEmptyField + nBitsLeft);
+        else {
+            currentByte = getBits(*srcIt, srcEmptyField, CHAR_BIT);
+            if (srcEmptyField != 0)
+                currentByte |=
+                    getBits(*std::next(srcIt), 0,
+                            std::min(srcEmptyField,
+                                     static_cast<unsigned char>(
+                                         nBitsLeft + srcEmptyField - CHAR_BIT)))
+                    << (CHAR_BIT - srcEmptyField);
+        }
+
+        if (dstEmptyField + nBitsLeft < CHAR_BIT)
+            setBits(*dstIt, currentByte, dstEmptyField,
+                    dstEmptyField + nBitsLeft);
+        else {
+            setBits(*dstIt, currentByte, dstEmptyField, CHAR_BIT);
+            if (dstEmptyField != 0)
+                setBits(
+                    *std::next(dstIt),
+                    getBits(currentByte, CHAR_BIT - dstEmptyField, CHAR_BIT), 0,
+                    std::min(dstEmptyField,
+                             static_cast<unsigned char>(nBitsLeft - CHAR_BIT +
+                                                        dstEmptyField)));
+        }
+    }
+}
+
 export class Field {
+    struct EmptyField {
+        unsigned char length_;
+    };
     struct SingleField {
-        unsigned char offset_;
         unsigned char length_;
         std::span<std::byte> data_;
     };
     using MultiField = std::vector<Field>;
-    std::variant<
-        SingleField,
-        MultiField
-    > data_;
-public:
-    Field(unsigned char length, unsigned char offset = 0) : data_(SingleField{.offset_ = offset, .length_ = length}) {}
-    unsigned char size() const {
-        auto visitor = overloads {
-            [](SingleField field){
-                return 1 + (field.offset_ + field.length_ - 1) / CHAR_BIT;
+    std::variant<EmptyField, SingleField, MultiField> data_;
+
+   public:
+    Field(unsigned char length) : data_(EmptyField{.length_ = length}) {
+        assert(length);
+    }
+    Field(unsigned char length, std::span<std::byte> data)
+        : data_(SingleField{.length_ = length, .data_ = data}) {
+        assert(length);
+    }
+    explicit Field(std::initializer_list<Field> fields)
+        : data_{MultiField{fields}} {};
+    unsigned char nBytes() const {
+        auto visitor = overloads{
+            [](MultiField fields) {
+                return std::ranges::fold_left(fields, (unsigned char){},
+                                              [](auto res, const auto &field) {
+                                                  return res + field.nBytes();
+                                              });
             },
-            [](MultiField fields){
-                return std::ranges::fold_left(fields, (unsigned char){}, [](auto res, const auto &field){
-                        return res + field.size();
-                });
-            },
+            [](auto field) { return 1 + (field.length_ - 1) / CHAR_BIT; },
         };
         return std::visit(visitor, data_);
     }
-    unsigned char bitLen() const {
-        auto visitor = overloads {
-            [](SingleField field) {
-                return field.length_;
-            },
+    unsigned char nBits() const {
+        auto visitor = overloads{
             [](MultiField fields) -> unsigned char {
-                return std::ranges::fold_left(fields, (unsigned char){}, [](auto res, const auto &field){
-                        return res + field.bitLen();
-                });
-            }
+                return std::ranges::fold_left(fields, (unsigned char){},
+                                              [](auto res, const auto &field) {
+                                                  return res + field.nBits();
+                                              });
+            },
+            [](auto field) { return field.length_; },
         };
         return std::visit(visitor, data_);
     }
-    void set_storage(std::span<std::byte> span) {
-        auto visitor = overloads {
-            [span](SingleField &field){
-                field.data_ = span;
+    void to_bytes(unsigned char srcOffset, std::span<std::byte> bytes, unsigned char dstNBits, unsigned char dstOffset = 0,
+                  std::byte zValue = std::byte{}) const {
+        assert(dstNBits <= nBits());
+        bytes = bytes.subspan(dstOffset / CHAR_BIT);
+        dstOffset %= CHAR_BIT;
+        auto visitor = overloads{
+            [srcOffset, bytes, dstNBits, dstOffset, zValue](EmptyField field) {
+                assert(srcOffset < field.length_);
+                unsigned char srcNBits = field.length_ - srcOffset;
+                copyBits(std::ranges::views::repeat(zValue), bytes,
+                         std::min(dstNBits, srcNBits), 0, dstOffset);
             },
-            [span](MultiField &fields) mutable {
-                for (auto field : fields) {
-                    auto size = field.size();
-                    field.set_storage(span | std::ranges::views::take(size));
-                    span = span | std::ranges::views::drop(size);
+            [srcOffset, bytes, dstNBits, dstOffset, zValue](SingleField field) {
+                assert(srcOffset < field.length_);
+                unsigned char srcNBits = field.length_ - srcOffset;
+                copyBits(field.data_.subspan(srcOffset / CHAR_BIT), bytes,
+                    std::min(dstNBits, srcNBits), srcOffset % CHAR_BIT, dstOffset);
+            },
+            [srcOffset, bytes, dstNBits, dstOffset, zValue](MultiField fields) mutable {
+                for (auto &&field : fields) {
+                    if (srcOffset >= field.nBits()) {
+                        srcOffset -= field.nBits();
+                        continue;
+                    }
+                    field.to_bytes(srcOffset, bytes, std::min(field.nBits(), dstNBits), dstOffset, zValue);
+                    srcOffset = 0;
+                    if (field.nBits() >= dstNBits)
+                        break;
+                    dstNBits -= field.nBits();
+                    auto bits_div = std::div(dstOffset + field.nBits(), CHAR_BIT);
+                    bytes = bytes.subspan(bits_div.quot);
+                    dstOffset = bits_div.rem;
                 }
             },
         };
         return std::visit(visitor, data_);
     }
-    template <typename V>
-    V get() const {
-        auto visitor = overloads {
-            [](SingleField field) -> V {
-                unsigned char n_bytes = field.data_.size();
-                if (n_bytes == 1)
-                    return static_cast<V>(getBits(field.data_.front(), field.offset_, field.offset_ + field.length_));
-
-                V res{};
-                for (unsigned char i = 1; i < n_bytes - 1; ++i)
-                    res |= static_cast<V>(field.data_[i]) << (i * CHAR_BIT - field.offset_);
-                res |= static_cast<V>(getBits(field.data_.front(), field.offset_, CHAR_BIT));
-                unsigned char high_byte_start = CHAR_BIT * (n_bytes - 1);
-                res |= static_cast<V>(getBits(field.data_.back(), 0, field.length_ + field.offset_ - high_byte_start)) << (high_byte_start - field.offset_);
-                return res;
+    void from_bytes(unsigned char dstOffset, std::span<const std::byte> bytes,
+                    unsigned char srcNBits, unsigned char srcOffset = 0) {
+        bytes = bytes.subspan(srcOffset / CHAR_BIT);
+        srcOffset %= CHAR_BIT;
+        auto visitor = overloads{
+            [](EmptyField field) {},
+            [dstOffset, bytes, srcNBits, srcOffset](SingleField field) {
+                assert(dstOffset < field.length_);
+                unsigned char dstNBits = field.length_ - dstOffset;
+                copyBits(bytes, field.data_.subspan(dstOffset / CHAR_BIT),
+                    dstNBits, srcOffset, dstOffset % CHAR_BIT);
             },
-            [](MultiField fields) -> V {
-                return std::ranges::fold_left(fields, std::pair{(unsigned char){}, V{}}, [](auto res, const auto &field){
-                        auto [cur_offset, value] = res;
-                        return std::pair{cur_offset + field.bitLen(), value | (field.template get<V>() << cur_offset)};
-                }).second;
+            [dstOffset, bytes, srcNBits, srcOffset](MultiField fields) mutable {
+                for (auto &&field : fields) {
+                    if (dstOffset >= field.nBits()) {
+                        dstOffset -= field.nBits();
+                        continue;
+                    }
+                    field.from_bytes(dstOffset, bytes, srcNBits, srcOffset);
+                    dstOffset = 0;
+                    if (field.nBits() >= srcNBits)
+                        break;
+                    srcNBits -= field.nBits();
+                    auto bits_div = std::div(srcOffset + field.nBits(), CHAR_BIT);
+                    bytes = bytes.subspan(bits_div.quot);
+                    srcOffset = bits_div.rem;
+                }
             },
         };
         return std::visit(visitor, data_);
     }
 };
-}
+}  // namespace bit_field

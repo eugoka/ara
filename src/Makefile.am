@@ -3,6 +3,7 @@
 
 check_DATA = arm_semihosting.pcm \
 			 bit_field.pcm \
+			 ftdi.pcm \
 			 jtag.pcm
 
 all: $(check_DATA)

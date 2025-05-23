@@ -10,8 +10,9 @@ in
 
         buildInputs = with nixpkgs; [
             pkg-config
-            (lib.getLib libftdi)
-            (lib.getDev libftdi)
+            (lib.getLib libusb1)
+            (lib.getLib libftdi1)
+            (lib.getDev libftdi1)
             (lib.getLib gtest)
             (lib.getDev gtest)
             (lib.getDev magic-enum)

@@ -7,7 +7,8 @@
 #include <vector>
 
 #include "jtag.h"
-#include "libftdi1/ftdi.h"
+#include "bit_field.h"
+#include <libftdi1/ftdi.h>
 
 auto mpsse_byte_io_cmd(auto n_bytes) {
     assert(n_bytes);
@@ -62,10 +63,12 @@ struct jtag_driver {
         ftdi_write_data(ftdi.get(), cmd, sizeof(cmd)); // TODO: ERROR
         ftdi_ = std::move(ftdi);
     }
-    void submit_loop_and_move(unsigned int loop_count, unsigned char *in,
-                              const unsigned char *out, unsigned int n_tms,
+    void submit_loop_and_move(void *in,
+                              const void *out, unsigned int n_tms,
                               unsigned char tms_bits) {
+        auto loop_count = bit_field_n_bits(out);
         assert(loop_count);
+        assert(!in || loop_count == bit_field_n_bits(in));
         auto div_bytes = std::div(loop_count - 1, 8);
         auto n_bytes = div_bytes.quot, n_bits = div_bytes.rem + 1;
         assert(n_bytes <= MPSSE_CMD_MAX_BYTES);
@@ -74,17 +77,19 @@ struct jtag_driver {
         if (n_bytes) {
             std::ranges::move(mpsse_byte_io_cmd(n_bytes),
                               std::back_inserter(mpsse_data));
-            if (out)
-                std::move(out, out + n_bytes, std::back_inserter(mpsse_data));
-            else
-                std::fill_n(std::back_inserter(mpsse_data), n_bytes, 0xff);
+            auto cmd_size = mpsse_data.size();
+            mpsse_data.resize(cmd_size + n_bytes);
+            bit_field_to_bytes(out, 0, mpsse_data.data() + cmd_size, n_bytes * CHAR_BIT, 0, 0xff);
         }
-        if (n_bits > 1)
+        unsigned char last_byte = 0;
+        bit_field_to_bytes(out, n_bytes * CHAR_BIT, &last_byte, bit_field_n_bits(out) - n_bytes * CHAR_BIT, 0, 0xff);
+        if (n_bits > 1) {
             std::ranges::move(
-                mpsse_bit_io_cmd(n_bits - 1, out ? out[n_bytes] : 1),
+                mpsse_bit_io_cmd(n_bits - 1, last_byte),
                 std::back_inserter(mpsse_data));
+        }
         std::ranges::move(
-            mpsse_tms_i_cmd(n_tms, tms_bits, out ? (out[n_bytes] >> (n_bits - 1)) : 1),
+            mpsse_tms_i_cmd(n_tms, tms_bits, last_byte >> (n_bits - 1)),
             std::back_inserter(mpsse_data));
         auto tc = ftdi_write_data_submit(ftdi_.get(), mpsse_data.data(),
                                          mpsse_data.size());
@@ -93,23 +98,23 @@ struct jtag_driver {
     }
     struct request {
         struct ftdi_transfer_control *tc_;
-        unsigned char *in_;
+        void *in_;
         unsigned n_bytes_;
         unsigned n_bits_;
-        request(struct ftdi_transfer_control *tc, unsigned char *in,
+        request(struct ftdi_transfer_control *tc, void *in,
                 unsigned n_bytes, unsigned n_bits)
             : tc_(tc), in_(in), n_bytes_(n_bytes), n_bits_(n_bits) {}
-        template <typename It>
-        void set_data(It it) const {
-            if (!in_) return;
-            std::move(it, it + n_bytes_, in_);
+        void set_data(unsigned char *it) const {
+            if (in_ == nullptr) return;
+            bit_field_from_bytes(in_, 0, it, n_bytes_ * CHAR_BIT, 0);
             unsigned bits_in_low = n_bits_ - 1;
             unsigned char high_bits = 0; //it[mpsse_buf_size() - 1] << bits_in_low;
             unsigned char low_bits = 0;
             if (n_bits_ > 1) {
                 low_bits = it[n_bytes_] >> (8 - bits_in_low);
             }
-            in_[n_bytes_] = low_bits | high_bits;
+            unsigned char last_byte = low_bits | high_bits;
+            bit_field_from_bytes(in_, n_bytes_ * CHAR_BIT, &last_byte, bit_field_n_bits(in_) - n_bytes_ * CHAR_BIT, 0);
         }
         unsigned mpsse_buf_size() const {
             return n_bytes_ + (n_bits_ > 1 ? 1 : 0) + 1;
@@ -123,11 +128,12 @@ struct jtag_driver {
                     }));
         for (unsigned int bytes_read = 0; bytes_read < read_buffer.size(); )
             bytes_read += ftdi_read_data(ftdi_.get(), read_buffer.data() + bytes_read, read_buffer.size() - bytes_read);
-        auto read_buffer_it = read_buffer.begin();
+        auto read_buffer_it = read_buffer.data();
         for (auto &&request : request_queue) {
             request.set_data(read_buffer_it);
             read_buffer_it += request.mpsse_buf_size();
         }
+        request_queue = std::vector<request>{};
         return JTAG_OK;
     }
 };
@@ -140,10 +146,10 @@ enum jtag_error jtag_deinit(struct jtag_driver *driver) {
 }
 
 void jtag_submit_loop_and_move(struct jtag_driver *driver,
-                               unsigned int loop_count, unsigned char *in,
-                               const unsigned char *out, unsigned int n_tms,
+                               void *in,
+                               const void *out, unsigned int n_tms,
                                int tms_bits) {
-    return driver->submit_loop_and_move(loop_count, in, out, n_tms, tms_bits);
+    return driver->submit_loop_and_move(in, out, n_tms, tms_bits);
 }
 
 enum jtag_error jtag_complete(struct jtag_driver *driver) {
